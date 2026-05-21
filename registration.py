@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import datetime
@@ -10,6 +9,7 @@ import uuid
 import textwrap
 import msal
 import requests
+import time  # <-- MODIFICATION: Imported time for auto-retry delay
 from pathlib import Path
 
 # ==========================================
@@ -67,7 +67,7 @@ load_css("style1.css")
 # ==========================================
 # SHAREPOINT CONNECTION — MSAL + Graph API
 # ==========================================
-@st.cache_resource
+@st.cache_data(ttl=3000)
 def get_access_token() -> str:
     """Authenticate with Azure AD and return a Graph API access token."""
     authority = f"https://login.microsoftonline.com/{TENANT_ID}"
@@ -81,7 +81,7 @@ def get_access_token() -> str:
         raise ConnectionError(f"SharePoint authentication failed: {result.get('error_description', result)}")
     return result["access_token"]
 
-@st.cache_resource
+@st.cache_data(ttl=86400)
 def get_site_id() -> str:
     """Resolve the SharePoint site ID once and cache it."""
     token = get_access_token()
@@ -92,56 +92,77 @@ def get_site_id() -> str:
         raise ConnectionError(f"Could not find SharePoint site '{SITE_PATH}': {resp.text}")
     return resp.json()["id"]
 
+# MODIFICATION: Added an internal retry loop to silently handle token drops
 @st.cache_data(ttl=300)
 def load_data() -> pd.DataFrame:
     """Fetch all student records from the SharePoint list into a DataFrame."""
-    token   = get_access_token()
-    site_id = get_site_id()
-    headers = {"Authorization": f"Bearer {token}"}
+    for attempt in range(3):
+        try:
+            token   = get_access_token()
+            site_id = get_site_id()
+            headers = {"Authorization": f"Bearer {token}"}
 
-    # 1. Fetch Dynamic Column Mappings to resolve generic internal names (field_1, field_2...)
-    columns_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{DATA_LIST_NAME}/columns"
-    col_resp = requests.get(columns_url, headers=headers)
-    column_mapping = {}
-    if col_resp.status_code == 200:
-        cols_data = col_resp.json().get("value", [])
-        column_mapping = {col["name"]: col["displayName"] for col in cols_data if "name" in col and "displayName" in col}
+            # 1. Fetch Dynamic Column Mappings to resolve generic internal names (field_1, field_2...)
+            columns_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{DATA_LIST_NAME}/columns"
+            col_resp = requests.get(columns_url, headers=headers)
+            
+            # If the token is rejected, force a token clear and restart the loop silently
+            if col_resp.status_code == 401:
+                get_access_token.clear()
+                continue
+            
+            column_mapping = {}
+            if col_resp.status_code == 200:
+                cols_data = col_resp.json().get("value", [])
+                column_mapping = {col["name"]: col["displayName"] for col in cols_data if "name" in col and "displayName" in col}
 
-    # 2. Paginate through all items (Graph returns max 5000 per page)
-    url = (
-        f"https://graph.microsoft.com/v1.0/sites/{site_id}"
-        f"/lists/{DATA_LIST_NAME}/items?expand=fields&$top=5000"
-    )
-    records = []
-    while url:
-        resp = requests.get(url, headers=headers)
-        if resp.status_code != 200:
-            raise ValueError(f"Failed to fetch list '{DATA_LIST_NAME}': {resp.text}")
-        data = resp.json()
-        records.extend(item["fields"] for item in data.get("value", []))
-        url = data.get("@odata.nextLink")   # follow pagination if >5000 rows
+            # 2. Paginate through all items (Graph returns max 5000 per page)
+            url = (
+                f"https://graph.microsoft.com/v1.0/sites/{site_id}"
+                f"/lists/{DATA_LIST_NAME}/items?expand=fields&$top=5000"
+            )
+            records = []
+            while url:
+                resp = requests.get(url, headers=headers)
+                
+                # Check for pagination token expiration
+                if resp.status_code == 401:
+                    get_access_token.clear()
+                    raise ValueError("Token expired mid-pagination")
+                    
+                if resp.status_code != 200:
+                    raise ValueError(f"Failed to fetch list '{DATA_LIST_NAME}': {resp.text}")
+                data = resp.json()
+                records.extend(item["fields"] for item in data.get("value", []))
+                url = data.get("@odata.nextLink")   # follow pagination if >5000 rows
 
-    df = pd.DataFrame(records)
-    
-    # Apply the display name translations dynamically
-    if column_mapping:
-        df.rename(columns=column_mapping, inplace=True)
-        
-    # Match the incoming 'Form Access #' column structure to your logic's expectation ('C#')
-    if "Form Access #" in df.columns and "C#" not in df.columns:
-        df.rename(columns={"Form Access #": "C#"}, inplace=True)
+            df = pd.DataFrame(records)
+            
+            # Apply the display name translations dynamically
+            if column_mapping:
+                df.rename(columns=column_mapping, inplace=True)
+                
+            # Match the incoming 'Form Access #' column structure to your logic's expectation ('C#')
+            if "Form Access #" in df.columns and "C#" not in df.columns:
+                df.rename(columns={"Form Access #": "C#"}, inplace=True)
 
-    df.columns = df.columns.astype(str).str.strip()
+            df.columns = df.columns.astype(str).str.strip()
 
-    if "StudentID" not in df.columns or "C#" not in df.columns:
-        raise ValueError(
-            f"SharePoint list '{DATA_LIST_NAME}' must contain 'StudentID' and 'C#' (or 'Form Access #') columns. "
-            f"Columns found: {list(df.columns)}"
-        )
+            if "StudentID" not in df.columns or "C#" not in df.columns:
+                raise ValueError(
+                    f"SharePoint list '{DATA_LIST_NAME}' must contain 'StudentID' and 'C#' (or 'Form Access #') columns. "
+                    f"Columns found: {list(df.columns)}"
+                )
 
-    df["StudentID"] = df["StudentID"].astype(str).str.strip().str.lower()
-    df["C#"]        = df["C#"].astype(str).str.strip().str.lower()
-    return df
+            df["StudentID"] = df["StudentID"].astype(str).str.strip().str.lower()
+            df["C#"]        = df["C#"].astype(str).str.strip().str.lower()
+            
+            return df # Successful load
+            
+        except Exception as e:
+            if attempt == 2: # Give up only after 3 failed attempts
+                raise e
+            get_access_token.clear() # Clear bad token before trying again
 
 # ==========================================
 # GENERAL HELPERS
@@ -341,12 +362,16 @@ def init_state():
 
 init_state()
 
-# Load data
+# MODIFICATION: Replaced st.error crash screen with a silent background auto-retry loop
 try:
     df = load_data()
-except Exception as e:
-    st.error(f"Connection Error: {e}")
-    st.stop()
+except Exception:
+    # Instead of showing a red error, show a friendly loading message and retry in 3 seconds
+    st.info("🔄 Connecting to server... please wait.")
+    time.sleep(3)
+    get_access_token.clear()
+    load_data.clear()
+    st.rerun()
 
 # ==========================================
 # UI HELPERS
