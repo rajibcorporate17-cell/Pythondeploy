@@ -624,15 +624,15 @@ if st.session_state.step == 1:
     <div class="form-card">
         <div class="step-badge">🔒 STEP 0 OF 6</div>
         <div class="form-title">Identity Verification</div>
-        <div class="form-subtitle">Enter your pre-issued Student ID and Access Card # to access your registration.</div>
-        <div class="info-banner">ℹ️ Your <b>Student ID</b> and <b>Access Card #</b> were provided by your program coordinator.</div>
+        <div class="form-subtitle">Enter your pre-issued Student ID and C# to access your registration.</div>
+        <div class="info-banner">ℹ️ Your <b>Student ID</b> and <b>C#</b> were provided by your program coordinator.</div>
         <div class="credentials-label">Enter Your Credentials</div>
     </div>
     """, unsafe_allow_html=True)
 
     with st.form("login"):
         id_input    = st.text_input("Student ID *", placeholder="e.g. A0000000000")
-        card_input  = st.text_input("Access Card # *", type="password", placeholder="Enter your Access Card number")
+        card_input  = st.text_input("C# *", type="password", placeholder="Enter your C#")
         if st.form_submit_button("🔒 Verify and Access My Registration"):
             # Match on StudentID + Access Card# (not C#)
             card_col = None
@@ -656,7 +656,7 @@ if st.session_state.step == 1:
                 st.session_state.step = 2
                 st.rerun()
             else:
-                st.error("❌ Invalid Credentials. Please check your Student ID and Access Card # and try again.")
+                st.error("❌ Invalid Credentials. Please check your Student ID and C# and try again.")
     render_page_end()
 
 
